@@ -1,0 +1,281 @@
+const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+const http = require('http');
+
+// ⚠️ এখানে তোমার বটের আসল টোকেন বসাও
+const token = '8940826358:AAEnt_hGzxm5rwHMu1kQ6K5goKcMZQfR6qU'; 
+
+// ⚠️ এখানে তোমার নিজের টেলিগ্রাম আইডিটি বসাও (যেমন: 123456789)
+const OWNER_ID = 0; 
+
+const bot = new TelegramBot(token, {polling: true});
+let isBotActive = true; 
+let activeChatId = null; 
+let lastFetchedPeriod = null;
+
+// HTML ফাইলের কনফিগারেশন ও স্টেট ট্র্যাকিং
+const SMALL_NUMBERS = [5, 6, 7, 8, 9];
+const BIG_NUMBERS = [0, 1, 2, 3, 4];
+const CYCLIC_PATTERN = [1, 2, 3, 4, 5, 5, 4, 3, 2, 1];
+
+let historyData = []; 
+let stats = { wins: 0, losses: 0 };
+let streakState = { currentStreak: 0, maxWinStreak: 0, maxLossStreak: 0 };
+let recentPredictionCounts = { BIG: 0, SMALL: 0 };
+let cycleIndex = 0;
+let consecutiveLosses = 0;
+
+console.log("রিশার আসল HTML ফর্মুলা বট চালু হচ্ছে... 🚀");
+
+const CURRENT_API = 'https://api.bdg88zf.com/api/webapi/GetGameIssue';
+const HISTORY_API = 'https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json';
+const REQUEST_DATA = { typeId: 1, language: 0, random: "e7fe6c090da2495ab8290dac551ef1ed", signature: "1F390E2B2D8A55D693E57FD905AE73A7", timestamp: 1723726679 };
+
+// বটের জন্য সেভ করা প্রেডিকশন ভেরিয়েবল
+let nextPredictionObj = { prediction: "SMALL", confidence: 60, oppositeNumber: 4 };
+
+// 🛠️ HTML ফাইলের অপোজিট নম্বর খোঁজার লজিক
+const getOppositeNumber = (prediction) => {
+    const arr = prediction === "BIG" ? SMALL_NUMBERS : BIG_NUMBERS;
+    const frequency = arr.map(num => ({
+        number: num,
+        count: historyData.filter(h => h.result === num.toString()).length
+    }));
+    const minCount = Math.min(...frequency.map(f => f.count));
+    const leastFrequentNumbers = frequency.filter(f => f.count === minCount);
+    return leastFrequentNumbers[Math.floor(Math.random() * leastFrequentNumbers.length)]?.number ?? arr[Math.floor(Math.random() * arr.length)];
+};
+
+// 🔮 হুবহু HTML ফাইল থেকে নেওয়া আসল spyPredict এআই ফাংশন
+const spyPredict = () => {
+    if (historyData.length < 5) {
+        const prediction = Math.random() < 0.5 ? "BIG" : "SMALL";
+        recentPredictionCounts[prediction]++;
+        cycleIndex = (cycleIndex + 1) % CYCLIC_PATTERN.length;
+        return { prediction, confidence: 55 };
+    }
+
+    const recentResults = historyData
+        .filter(h => h.result !== "-")
+        .slice(0, 50)
+        .map(h => Number(h.result))
+        .reverse();
+    const resultTypes = recentResults.map(val => val >= 5 ? "BIG" : "SMALL");
+
+    let factorScores = {};
+    let weights = { frequency: 0.25, markov: 0.25, streak: 0.20, momentum: 0.15, entropy: 0.10, volatility: 0.05, cycle: 0.05 };
+
+    // Frequency calculation
+    const bigCount = recentResults.filter(num => num >= 5).length;
+    const totalCount = recentResults.length;
+    const probBig = totalCount > 0 ? bigCount / totalCount : 0.5;
+    const biasCorrection = Math.min(0.5, Math.max(-0.5, (recentPredictionCounts.SMALL - recentPredictionCounts.BIG) / (recentPredictionCounts.SMALL + recentPredictionCounts.BIG + 1)));
+    factorScores.frequency = (probBig - 0.5 - biasCorrection * 0.2) * 100;
+
+    // Markov analysis
+    const markovStates = [];
+    for (let i = 2; i < resultTypes.length; i++) {
+        markovStates.push(`${resultTypes[i-2]}_${resultTypes[i-1]}_${resultTypes[i]}`);
+    }
+    const lastState = resultTypes.length >= 2 ? `${resultTypes[1]}_${resultTypes[0]}` : "UNKNOWN";
+    const transitions = { BIG: 0, SMALL: 0 };
+    markovStates.forEach(state => {
+        if (state.startsWith(lastState)) {
+            const outcome = state.split('_')[2];
+            transitions[outcome]++;
+        }
+    });
+    const totalTransitions = transitions.BIG + transitions.SMALL + 2;
+    const bigTransitionProb = totalTransitions > 0 ? (transitions.BIG + 1) / totalTransitions : 0.5;
+    factorScores.markov = (bigTransitionProb - 0.5) * 100;
+
+    // Streak logic
+    let currentStreak = 1;
+    let streakType = resultTypes[0];
+    for (let i = 1; i < resultTypes.length; i++) {
+        if (resultTypes[i] === streakType) currentStreak++;
+        else break;
+    }
+    const streakBias = (currentStreak >= 3 || consecutiveLosses >= 3) ? -20 * Math.min(1, currentStreak / 5) : 15;
+    factorScores.streak = streakType === "BIG" ? streakBias : -streakBias;
+
+    // Momentum, Entropy, Volatility, Cycle
+    factorScores.momentum = resultTypes.slice(0, 10).reduce((sum, type) => sum + (type === "BIG" ? 1 : -1), 0) * 10;
+    
+    const numberCounts = Array(10).fill(0);
+    recentResults.forEach(num => numberCounts[num]++);
+    const probabilities = numberCounts.map(count => count / recentResults.length).filter(p => p > 0);
+    const entropy = -probabilities.reduce((sum, p) => sum + p * Math.log2(p), 0);
+    factorScores.entropy = (0.5 - (entropy / Math.log2(10))) * 60;
+
+    const recentChanges = resultTypes.slice(0, 20).reduce((count, type, i) => i > 0 && type !== resultTypes[i-1] ? count + 1 : count, 0);
+    factorScores.volatility = (0.5 - (recentChanges / (resultTypes.slice(0, 20).length - 1 || 1))) * 50;
+
+    const cycleLength = Math.max(5, Math.min(15, Math.round(recentResults.length / (recentChanges + 1))));
+    factorScores.cycle = ((CYCLIC_PATTERN[cycleIndex % cycleLength] - 3) / 2) * 30;
+
+    // Final score sum
+    let finalScore = Object.keys(factorScores).reduce((sum, key) => sum + factorScores[key] * weights[key], 0);
+
+    if (consecutiveLosses >= 3) finalScore = -finalScore; // Contrarian strategy
+
+    let confidence = 50 + Math.abs(finalScore) * 0.6;
+    confidence = Math.min(95, Math.max(40, confidence));
+
+    const prediction = finalScore >= 0 ? "BIG" : "SMALL";
+    recentPredictionCounts[prediction]++;
+    cycleIndex = (cycleIndex + 1) % cycleLength;
+
+    return { prediction, confidence: Math.round(confidence) };
+};
+
+// স্ট্রিক ও ড্যাশবোর্ড আপডেট করা
+function updateStreakDashboard(isWin) {
+    if (isWin) {
+        stats.wins++;
+        if (streakState.currentStreak >= 0) streakState.currentStreak++;
+        else streakState.currentStreak = 1;
+        if (streakState.currentStreak > streakState.maxWinStreak) streakState.maxWinStreak = streakState.currentStreak;
+        consecutiveLosses = 0;
+    } else {
+        stats.losses++;
+        if (streakState.currentStreak <= 0) streakState.currentStreak--;
+        else streakState.currentStreak = -1;
+        if (Math.abs(streakState.currentStreak) > streakState.maxLossStreak) streakState.maxLossStreak = Math.abs(streakState.currentStreak);
+        consecutiveLosses++;
+    }
+}
+
+// টেলিগ্রাম কমান্ড সেটিংস
+bot.onText(/\/start/, (msg) => {
+    activeChatId = msg.chat.id;
+    bot.sendMessage(activeChatId, "⚡ **OPPOSITE GAME** বটে স্বাগতম, রিশা!\n\nতোমার লাইভ ড্যাশবোর্ডের আসল অ্যালগরিদম লোড করা হয়েছে। প্রতি ১ মিনিট পর পর অটোমেটিক প্রেডিকশন এখানে আসবে।\n\n📜 হিস্ট্রি দেখতে লেখো: /history");
+});
+
+bot.onText(/\/history/, (msg) => {
+    if (historyData.length === 0) return bot.sendMessage(msg.chat.id, "📊 এখনো কোনো হিস্ট্রি রেকর্ড জমা হয়নি। গেম চলতে দিন!");
+    
+    let historyMsg = "📜 **PREDICTION HISTORY (Last 10)**\n━━━━━━━━━━━━━━━━━━\n";
+    historyData.slice(0, 10).forEach(item => {
+        if(item.result !== "-") {
+            const icon = item.resultStatus === "WIN" ? "✅" : "❌";
+            historyMsg += `${icon} **Period:** \`${item.period}\` | **Pred:** ${item.prediction} | **Result:** ${item.result} (${item.actualType}) [${item.resultStatus}]\n`;
+        }
+    });
+    historyMsg += "━━━━━━━━━━━━━━━━━━";
+    bot.sendMessage(msg.chat.id, historyMsg, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/off/, (msg) => {
+    if (msg.from.id !== OWNER_ID) return bot.sendMessage(msg.chat.id, "❌ আপনি এই বটের মালিক নন!");
+    isBotActive = false;
+    bot.sendMessage(msg.chat.id, "🛑 বটটি সাময়িকভাবে বন্ধ করা হয়েছে।");
+});
+
+bot.onText(/\/on/, (msg) => {
+    if (msg.from.id !== OWNER_ID) return bot.sendMessage(msg.chat.id, "❌ আপনি এই বটের মালিক নন!");
+    isBotActive = true;
+    bot.sendMessage(msg.chat.id, "🟢 বটটি चालू করা হয়েছে।");
+});
+
+// প্রতি ১ মিনিট ট্র্যাক করার লুপ
+async function checkGameLoop() {
+    if (!isBotActive || !activeChatId) return;
+
+    try {
+        const currentRes = await axios.post(CURRENT_API, REQUEST_DATA);
+        if (currentRes.data && currentRes.data.data && currentRes.data.data.issueNumber) {
+            const serverPeriod = currentRes.data.data.issueNumber.toString();
+            
+            if (lastFetchedPeriod && serverPeriod !== lastFetchedPeriod) {
+                // ১ মিনিট শেষ হলে এপিআই হিস্ট্রি থেকে আসল উইনিং নম্বর তুলে আনা
+                const historyRes = await axios.get(`${HISTORY_API}?ts=${Date.now()}`);
+                const latestGameResult = historyRes.data.data.list[0];
+                
+                const actualNumber = parseInt(latestGameResult.number);
+                const actualType = actualNumber >= 5 ? "BIG" : "SMALL";
+                const isWin = nextPredictionObj.prediction === actualType;
+
+                // ড্যাশবোর্ড আপডেট করা
+                updateStreakDashboard(isWin);
+
+                // হিস্ট্রি অ্যারেতে ডেটা পুশ করা
+                historyData.unshift({
+                    period: lastFetchedPeriod.slice(-6),
+                    prediction: nextPredictionObj.prediction,
+                    result: actualNumber.toString(),
+                    actualType: actualType,
+                    resultStatus: isWin ? "WIN" : "LOSS"
+                });
+
+                const totalBets = stats.wins + stats.losses;
+                const winRate = totalBets === 0 ? 0 : ((stats.wins / totalBets) * 100).toFixed(0);
+                
+                // ১. রেজাল্ট কার্ড পাঠানো (নিখুঁত ফরম্যাট)
+                const resultMessage = `
+✅ **Period ${lastFetchedPeriod} Result: ${isWin ? 'WIN' : 'LOSS'}**
+🎯 **Actual Number:** \`${actualNumber} (${actualType})\`
+🔮 **Our Prediction Was:** **${nextPredictionObj.prediction}**
+━━━━━━━━━━━━━━━━━━
+📊 **Today:** ✅ \`${stats.wins} Win\` | ❌ \`${stats.losses} Loss\` | 🎲 \`${winRate}%\`
+🔥 **Max Win Streak:** \`${streakState.maxWinStreak}\` | 💔 **Max Loss Streak:** \`${streakState.maxLossStreak}\`
+━━━━━━━━━━━━━━━━━━
+_Created by Mixona_
+                `;
+                await bot.sendMessage(activeChatId, resultMessage, { parse_mode: 'Markdown' });
+
+                // ২. নতুন পিরিয়ডের জন্য আসল এআই প্রেডিকশন জেনারেট করা
+                const aiDecision = spyPredict();
+                nextPredictionObj.prediction = aiDecision.prediction;
+                nextPredictionObj.confidence = aiDecision.confidence;
+                nextPredictionObj.oppositeNumber = getOppositeNumber(aiDecision.prediction);
+
+                const nextPeriodFull = (BigInt(serverPeriod) + 1n).toString();
+
+                // ৩. নতুন প্রেডিকশন কার্ড পাঠানো
+                const predictionMessage = `
+⚡ **OPPOSITE GAME PREDICTION**
+━━━━━━━━━━━━━━━━━━
+🆔 **Period:** \`${nextPeriodFull}\`
+🔮 **Prediction:** **${nextPredictionObj.prediction}**
+🎯 **Opposite Number:** \`${nextPredictionObj.oppositeNumber}\`
+🎲 **Confidence:** \`${nextPredictionObj.confidence}%\`
+━━━━━━━━━━━━━━━━━━
+🔥 **Win Streak:** \`${Math.max(0, streakState.currentStreak)}\` 🔥
+_Result will update automatically!_
+━━━━━━━━━━━━━━━━━━
+_Created by Mixona_
+                `;
+                
+                setTimeout(() => {
+                    bot.sendMessage(activeChatId, predictionMessage, { parse_mode: 'Markdown' });
+                }, 2000);
+            }
+            
+            if (!lastFetchedPeriod) {
+                lastFetchedPeriod = serverPeriod;
+                const aiDecision = spyPredict();
+                nextPredictionObj.prediction = aiDecision.prediction;
+                nextPredictionObj.confidence = aiDecision.confidence;
+                nextPredictionObj.oppositeNumber = getOppositeNumber(aiDecision.prediction);
+                
+                const nextPeriodFull = (BigInt(serverPeriod) + 1n).toString();
+                bot.sendMessage(activeChatId, `🎰 আসল HTML অ্যালগরিদম সচল হয়েছে পিরিয়ড: ${nextPeriodFull}-এর জন্য। ১ মিনিট অপেক্ষা করো রিশা!`);
+            } else {
+                lastFetchedPeriod = serverPeriod;
+            }
+        }
+    } catch (error) {
+        console.error("Error:", error.message);
+    }
+}
+
+// প্রতি ৫ সেকেন্ড পর পর নতুন ডাটা চেক লুপ
+setInterval(checkGameLoop, 5000);
+
+// সার্ভার পিং পোর্ট সচল রাখা
+http.createServer((req, res) => {
+    res.write("HTML Algorithm System is fully live!");
+    res.end();
+}).listen(process.env.PORT || 3000);
+                                              
